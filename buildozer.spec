@@ -2,26 +2,24 @@
 
 title = Presences
 package.name = presences
-package.domain = org.anis
+package.domain = org.presences
 
 source.dir = .
-source.include_exts = py,png,jpg,kv,atlas,json
+source.include_exts = py,png,jpg,jpeg,kv,atlas
 
 version = 1.0
-
-requirements = python3,kivy
+requirements = python3,kivy==2.3.0
 
 orientation = portrait
 fullscreen = 0
 
 android.permissions = WRITE_EXTERNAL_STORAGE,READ_EXTERNAL_STORAGE
 
-android.api = 34
+android.api = 31
 android.minapi = 21
 android.ndk = 25b
-android.accept_sdk_license = True
+android.archs = arm64-v8a
 
-[buildozer]
+android.allow_backup = True
 
-log_level = 2
-warn_on_root = 1
+p4a.branch = v2023.09.21
