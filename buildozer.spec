@@ -1,44 +1,25 @@
-name: Build APK
+[app]
 
-on:
-  workflow_dispatch:
-  push:
-    branches: [ main, principal ]
+title = Presences
+package.name = presences
+package.domain = org.presences
 
-jobs:
-  build:
-    runs-on: ubuntu-22.04
+source.dir = .
+source.include_exts = py,png,jpg,jpeg,kv,atlas
 
-    steps:
-    - name: Checkout
-      uses: actions/checkout@v4
+version = 1.0
+requirements = python3,kivy==2.3.0
 
-    - name: Setup Python 3.11
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.11'
+orientation = portrait
+fullscreen = 0
 
-    - name: Installer les dépendances système
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y \
-          git zip unzip openjdk-17-jdk autoconf automake libtool \
-          pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev \
-          cmake libffi-dev libssl-dev build-essential ccache
+android.permissions = WRITE_EXTERNAL_STORAGE,READ_EXTERNAL_STORAGE
 
-    - name: Installer Buildozer et Cython
-      run: |
-        pip install --upgrade pip setuptools wheel
-        pip install buildozer cython==0.29.36
+android.api = 31
+android.minapi = 21
+android.ndk = 25b
+android.archs = arm64-v8a
 
-    - name: Compiler l'APK
-      run: |
-        yes | buildozer -v android debug
+android.allow_backup = True
 
-    - name: Uploader l'APK
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: apk-package
-        path: bin/*.apk
-        if-no-files-found: warn
+p4a.branch = v2023.09.21
