@@ -3,38 +3,34 @@ name: Build APK
 on:
   workflow_dispatch:
   push:
-    branches: [ main ]
+    branches: [ main, principal ]
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
 
     steps:
-    - name: Checkout repository
+    - name: Checkout
       uses: actions/checkout@v4
 
-    - name: Setup Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.11'
-
-    - name: Install system dependencies
+    - name: Installer les dépendances
       run: |
         sudo apt-get update
-        sudo apt-get install -y git zip unzip openjdk-17-jdk autoconf libtool pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev cmake libffi-dev libssl-dev
+        sudo apt-get install -y git zip unzip openjdk-17-jdk autoconf automake libtool pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo5 cmake libffi-dev libssl-dev build-essential ccache
 
-    - name: Install Buildozer and Cython
+    - name: Installer Buildozer
       run: |
-        pip install --upgrade pip
-        pip install buildozer
-        pip install "cython<3.0"
+        sudo pip3 install --upgrade pip setuptools wheel
+        sudo pip3 install buildozer cython==0.29.36
 
-    - name: Build APK with Buildozer
+    - name: Compiler l'APK
       run: |
         yes | buildozer -v android debug
 
-    - name: Upload APK
+    - name: Uploader l'APK
+      if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: my-app-apk
+        name: apk-package
         path: bin/*.apk
+        if-no-files-found: warn
