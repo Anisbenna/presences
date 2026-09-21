@@ -22,5 +22,6 @@ android.archs = arm64-v8a
 
 android.allow_backup = True
 android.accept_sdk_license = True
+android.gradle_version = 8.0.2
 
 p4a.branch = release-2024.01.21
