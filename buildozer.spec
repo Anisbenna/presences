@@ -22,4 +22,4 @@ android.archs = arm64-v8a
 
 android.allow_backup = True
 
-p4a.branch = v2023.09.21
+p4a.branch = master
