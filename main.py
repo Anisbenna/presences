@@ -1,8 +1,10 @@
 """
 ================================================
-  APPLICATION DE GESTION DES PRÉSENCES - V12
-  - Trait barré BLEU
-  - Couleurs vert et rouge plus claires
+  APPLICATION DE GESTION DES PRÉSENCES - V14
+  - 20 séquences de (4 dates + 1 MT)
+  - Barre de défilement horizontale fine (intégrée)
+  - Adaptée Android plein écran
+  - Mode barré avec trait bleu
 ================================================
 """
 
@@ -16,7 +18,7 @@ from kivy.uix.popup import Popup
 from kivy.uix.spinner import Spinner
 from kivy.metrics import dp
 from kivy.core.window import Window
-from kivy.utils import get_color_from_hex
+from kivy.utils import get_color_from_hex, platform
 from kivy.graphics import (PushMatrix, PopMatrix, Rotate, Rectangle,
                            Color as GColor)
 
@@ -28,30 +30,33 @@ from datetime import date, datetime, timedelta
 # ---------- CONFIGURATION ----------
 FICHIER = "presences.json"
 
-NB_SEQUENCES = 10
+NB_SEQUENCES = 20
 SLOTS_PAR_SEQ = 4
 
-LARGEUR_NOM = dp(100)
-LARGEUR_CELL = dp(46)
-LARGEUR_MT = dp(60)
-LARGEUR_SEP = dp(8)
-HAUTEUR_ENTETE = dp(40)
-HAUTEUR_LIGNE = dp(40)
+# Dimensions adaptées au mobile
+LARGEUR_NOM = dp(80)
+LARGEUR_CELL = dp(38)
+LARGEUR_MT = dp(48)
+LARGEUR_SEP = dp(6)
+HAUTEUR_ENTETE = dp(42)
+HAUTEUR_LIGNE = dp(48)
 
-# ---------- COULEURS ----------
-C_PRESENT = "#81C784"      # vert clair
-C_ABSENT = "#E57373"       # rouge clair
-C_VIDE = "#E0E0E0"         # gris clair
+# Couleurs
+C_PRESENT = "#81C784"
+C_ABSENT = "#E57373"
+C_VIDE = "#E0E0E0"
 C_ENTETE = "#455A64"
 C_ENTETE_NOM = "#37474F"
 C_ENTETE_MT = "#546E7A"
 
-COULEUR_TRAIT = (0.13, 0.59, 0.95, 1)   # bleu vif (Material Blue 500)
+COULEUR_TRAIT = (0.13, 0.59, 0.95, 1)  # Bleu
 
-Window.size = (700, 750)
+# Taille simulée uniquement sur PC
+if platform != "android":
+    Window.size = (700, 750)
 
 
-# ---------- WIDGET : case pouvant être barrée ----------
+# ---------- WIDGET : case barrée ----------
 class CellButton(Button):
     """Case avec un trait diagonal bleu dessiné via Rectangle+Rotate."""
 
@@ -111,10 +116,20 @@ def structure_vide():
 
 
 def migrer_classe(c):
+    """Adapte une classe existante : ajoute les séquences manquantes si besoin."""
     if "sequences" in c:
+        while len(c["sequences"]) < NB_SEQUENCES:
+            c["sequences"].append({
+                "dates": [""] * SLOTS_PAR_SEQ,
+                "presences": {},
+                "barres": {},
+                "mt": {}
+            })
         for seq in c["sequences"]:
             seq.setdefault("mt", {})
             seq.setdefault("barres", {})
+            seq.setdefault("presences", {})
+            seq.setdefault("dates", [""] * SLOTS_PAR_SEQ)
         return c
 
     nouveau = structure_vide()
@@ -193,12 +208,12 @@ class AppPresences(App):
         # ===== Titre =====
         racine.add_widget(Label(
             text="GESTION DES PRÉSENCES",
-            size_hint_y=None, height=dp(28),
-            bold=True, font_size=dp(15)
+            size_hint_y=None, height=dp(32),
+            bold=True, font_size=dp(18)
         ))
 
         # ===== Sélecteur de classe =====
-        ligne_classe = BoxLayout(size_hint_y=None, height=dp(38), spacing=dp(4))
+        ligne_classe = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(4))
         ligne_classe.add_widget(Label(text="Classe :", size_hint_x=0.22))
         self.spinner_classe = Spinner(
             text="-- Aucune --", values=[], size_hint_x=0.78,
@@ -209,26 +224,26 @@ class AppPresences(App):
         racine.add_widget(ligne_classe)
 
         # ===== Boutons classes =====
-        ligne_gestion = BoxLayout(size_hint_y=None, height=dp(34), spacing=dp(4))
+        ligne_gestion = BoxLayout(size_hint_y=None, height=dp(40), spacing=dp(4))
         b_new = Button(text="+ Classe",
                        background_color=get_color_from_hex("#3F51B5"),
-                       color=(1, 1, 1, 1), font_size=dp(12))
+                       color=(1, 1, 1, 1), font_size=dp(13))
         b_new.bind(on_press=self.nouvelle_classe)
         b_ren = Button(text="Renommer",
                        background_color=get_color_from_hex("#795548"),
-                       color=(1, 1, 1, 1), font_size=dp(12))
+                       color=(1, 1, 1, 1), font_size=dp(13))
         b_ren.bind(on_press=self.renommer_classe)
         b_sup = Button(text="Suppr. classe",
                        background_color=get_color_from_hex("#B71C1C"),
-                       color=(1, 1, 1, 1), font_size=dp(12))
+                       color=(1, 1, 1, 1), font_size=dp(13))
         b_sup.bind(on_press=self.supprimer_classe)
         ligne_gestion.add_widget(b_new)
         ligne_gestion.add_widget(b_ren)
         ligne_gestion.add_widget(b_sup)
         racine.add_widget(ligne_gestion)
 
-        # ===== BOUTON MODE BARRÉ =====
-        ligne_mode = BoxLayout(size_hint_y=None, height=dp(40), spacing=dp(4))
+        # ===== Mode barré =====
+        ligne_mode = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(4))
         self.btn_mode = Button(
             text="MODE NORMAL (clic -> change le statut)",
             background_color=get_color_from_hex("#9E9E9E"),
@@ -240,40 +255,47 @@ class AppPresences(App):
 
         # ===== Info =====
         self.lbl_info = Label(
-            text="", size_hint_y=None, height=dp(20),
-            font_size=dp(11), color=(0.3, 0.3, 0.3, 1)
+            text="", size_hint_y=None, height=dp(22),
+            font_size=dp(12), color=(0.3, 0.3, 0.3, 1)
         )
         racine.add_widget(self.lbl_info)
 
         # ===== Ajouter élève =====
-        ligne_ajout = BoxLayout(size_hint_y=None, height=dp(36), spacing=dp(4))
+        ligne_ajout = BoxLayout(size_hint_y=None, height=dp(42), spacing=dp(4))
         self.champ_nom = TextInput(hint_text="Nom élève", multiline=False,
                                    size_hint_x=0.7)
         b_add_el = Button(text="+ Élève", size_hint_x=0.3,
                           background_color=get_color_from_hex("#2196F3"),
-                          color=(1, 1, 1, 1), font_size=dp(12))
+                          color=(1, 1, 1, 1), font_size=dp(13))
         b_add_el.bind(on_press=self.ajouter_eleve)
         ligne_ajout.add_widget(self.champ_nom)
         ligne_ajout.add_widget(b_add_el)
         racine.add_widget(ligne_ajout)
 
         # ===== Légende =====
-        legende = BoxLayout(size_hint_y=None, height=dp(22), spacing=dp(4))
+        legende = BoxLayout(size_hint_y=None, height=dp(24), spacing=dp(4))
         legende.add_widget(Label(text="P = Présent", size_hint_x=0.25,
-                                 font_size=dp(11),
+                                 font_size=dp(12),
                                  color=get_color_from_hex(C_PRESENT), bold=True))
         legende.add_widget(Label(text="A = Absent", size_hint_x=0.25,
-                                 font_size=dp(11),
+                                 font_size=dp(12),
                                  color=get_color_from_hex(C_ABSENT), bold=True))
         legende.add_widget(Label(text="Barré = bleu", size_hint_x=0.25,
-                                 font_size=dp(11),
+                                 font_size=dp(12),
                                  color=(0.13, 0.59, 0.95, 1), bold=True))
         legende.add_widget(Label(text="MT = libre", size_hint_x=0.25,
-                                 font_size=dp(11), color=(0.4, 0.4, 0.4, 1)))
+                                 font_size=dp(12), color=(0.4, 0.4, 0.4, 1)))
         racine.add_widget(legende)
 
-        # ===== Zone du tableau =====
-        self.scroll = ScrollView(do_scroll_x=True, do_scroll_y=True)
+        # ===== Zone du tableau (avec barre de défilement intégrée) =====
+        self.scroll = ScrollView(
+            do_scroll_x=True,
+            do_scroll_y=True,
+            scroll_type=['bars', 'content'],
+            bar_width=dp(10),
+            bar_color=(0.4, 0.5, 0.6, 1),
+            bar_inactive_color=(0.88, 0.88, 0.88, 1)
+        )
         self.tableau = BoxLayout(
             orientation="vertical", size_hint=(None, None), spacing=dp(1)
         )
@@ -630,7 +652,7 @@ class AppPresences(App):
 
         eleves = donnees["eleves"]
         sequences = donnees["sequences"]
-        self.lbl_info.text = f"Classe « {nom_classe} » — {len(eleves)} élève(s)"
+        self.lbl_info.text = f"Classe « {nom_classe} » — {len(eleves)} élève(s) — {NB_SEQUENCES} séquences"
 
         largeur_totale = (LARGEUR_NOM +
                           NB_SEQUENCES * (SLOTS_PAR_SEQ * LARGEUR_CELL + LARGEUR_MT + LARGEUR_SEP))
