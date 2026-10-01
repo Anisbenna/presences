@@ -1,10 +1,14 @@
 """
 ================================================
-  APPLICATION DE GESTION DES PRÉSENCES - V14
+  APPLICATION DE GESTION DES PRÉSENCES - V16
   - 20 séquences de (4 dates + 1 MT)
-  - Barre de défilement horizontale fine (intégrée)
+  - Barre de défilement horizontale fine
   - Adaptée Android plein écran
   - Mode barré avec trait bleu
+  - Sauvegarde / Restauration des données
+  - NOUVEAU : présences verrouillées après 1 jour (barrage toujours possible)
+  - NOUVEAU : onglet MODIFIER protégé par mot de passe
+  - NOUVEAU : envoi des données par mail (manuel + automatique 1x/jour)
 ================================================
 """
 
@@ -17,6 +21,7 @@ from kivy.uix.scrollview import ScrollView
 from kivy.uix.popup import Popup
 from kivy.uix.spinner import Spinner
 from kivy.metrics import dp
+from kivy.clock import Clock
 from kivy.core.window import Window
 from kivy.utils import get_color_from_hex, platform
 from kivy.graphics import (PushMatrix, PopMatrix, Rotate, Rectangle,
@@ -25,15 +30,28 @@ from kivy.graphics import (PushMatrix, PopMatrix, Rotate, Rectangle,
 import json
 import os
 import math
+import shutil
+import ssl
+import smtplib
+import hashlib
+import hmac
+import threading
+from email.message import EmailMessage
 from datetime import date, datetime, timedelta
 
 # ---------- CONFIGURATION ----------
 FICHIER = "presences.json"
+FICHIER_CONFIG = "config.json"   # mot de passe (haché) + réglages mail
+
+# Une présence reste modifiable le jour J et pendant DELAI_MODIF_JOURS jour(s)
+# après. Ensuite elle est verrouillée (seul le barrage reste possible).
+# 1 = modifiable aujourd'hui et hier ; 0 = modifiable le jour même seulement.
+DELAI_MODIF_JOURS = 1
+MDP_MIN = 4
 
 NB_SEQUENCES = 20
 SLOTS_PAR_SEQ = 4
 
-# Dimensions adaptées au mobile
 LARGEUR_NOM = dp(80)
 LARGEUR_CELL = dp(38)
 LARGEUR_MT = dp(48)
@@ -41,25 +59,58 @@ LARGEUR_SEP = dp(6)
 HAUTEUR_ENTETE = dp(42)
 HAUTEUR_LIGNE = dp(48)
 
-# Couleurs
 C_PRESENT = "#81C784"
 C_ABSENT = "#E57373"
 C_VIDE = "#E0E0E0"
+C_PRESENT_VERR = "#A8C5AA"   # présent verrouillé (plus pâle)
+C_ABSENT_VERR = "#D4A9A9"    # absent verrouillé (plus pâle)
+C_MODIF = "#E65100"          # orange : onglet MODIFIER actif
 C_ENTETE = "#455A64"
 C_ENTETE_NOM = "#37474F"
 C_ENTETE_MT = "#546E7A"
 
-COULEUR_TRAIT = (0.13, 0.59, 0.95, 1)  # Bleu
+COULEUR_TRAIT = (0.13, 0.59, 0.95, 1)
 
-# Taille simulée uniquement sur PC
 if platform != "android":
     Window.size = (700, 750)
 
 
+# ---------- DOSSIER DE SAUVEGARDES ----------
+def dossier_sauvegardes():
+    """Retourne le chemin du dossier de sauvegardes (créé si absent)."""
+    local = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sauvegardes")
+    if platform == "android":
+        d = "/storage/emulated/0/Download/Presences"
+    else:
+        d = local
+    try:
+        os.makedirs(d, exist_ok=True)
+        test = os.path.join(d, ".test_ecriture")
+        with open(test, "w") as f:
+            f.write("ok")
+        os.remove(test)
+        return d
+    except Exception:
+        # Android récent : Download peut être inaccessible -> dossier privé de l'appli
+        try:
+            os.makedirs(local, exist_ok=True)
+        except Exception:
+            pass
+        return local
+
+
+def liste_sauvegardes():
+    """Retourne la liste des fichiers de sauvegarde (triés du plus récent au plus ancien)."""
+    dossier = dossier_sauvegardes()
+    if not os.path.exists(dossier):
+        return []
+    fichiers = [f for f in os.listdir(dossier) if f.endswith(".json")]
+    fichiers.sort(reverse=True)
+    return fichiers
+
+
 # ---------- WIDGET : case barrée ----------
 class CellButton(Button):
-    """Case avec un trait diagonal bleu dessiné via Rectangle+Rotate."""
-
     def __init__(self, barre=False, **kwargs):
         super().__init__(**kwargs)
         self._barre = barre
@@ -80,19 +131,15 @@ class CellButton(Button):
         if (not self._barre) or self.width < 10 or self.height < 10:
             self._rect.size = (0, 0)
             return
-
         marge = 3
         w = self.width
         h = self.height
-
         dx = w - 2 * marge
         dy = h - 2 * marge
         longueur = math.sqrt(dx * dx + dy * dy)
         angle = math.degrees(math.atan2(dy, dx))
-
         x0 = self.x + marge
         y0 = self.y + marge
-
         self._rot.origin = (x0, y0)
         self._rot.angle = angle
         self._rect.pos = (x0, y0 - 1)
@@ -116,7 +163,6 @@ def structure_vide():
 
 
 def migrer_classe(c):
-    """Adapte une classe existante : ajoute les séquences manquantes si besoin."""
     if "sequences" in c:
         while len(c["sequences"]) < NB_SEQUENCES:
             c["sequences"].append({
@@ -135,7 +181,11 @@ def migrer_classe(c):
     nouveau = structure_vide()
     nouveau["eleves"] = c.get("eleves", [])
     anciennes_dates = c.get("dates", [])
-    anciennes_pres = c.get("presences", {})
+    anciennes_pres = c.get("presences", [])
+    if isinstance(anciennes_pres, dict):
+        anciennes_pres = anciennes_pres or {}
+    else:
+        anciennes_pres = {}
 
     for i, d in enumerate(anciennes_dates):
         seq_idx = i // SLOTS_PAR_SEQ
@@ -195,13 +245,156 @@ def parse_date(txt):
     return None
 
 
+# ---------- VERROUILLAGE DES PRÉSENCES ----------
+def est_verrouille(iso, aujourdhui=None):
+    """True si la date iso (AAAA-MM-JJ) est trop ancienne pour modifier les présences."""
+    if not iso:
+        return False
+    try:
+        d = datetime.strptime(iso, "%Y-%m-%d").date()
+    except Exception:
+        return False
+    aujourdhui = aujourdhui or date.today()
+    return (aujourdhui - d).days > DELAI_MODIF_JOURS
+
+
+# ---------- CONFIG : MOT DE PASSE + MAIL ----------
+CONFIG_DEFAUT = {
+    "mdp_sel": "",
+    "mdp_hash": "",
+    "smtp_serveur": "smtp.gmail.com",
+    "smtp_port": 465,
+    "expediteur": "",
+    "mdp_app": "",
+    "destinataire": "",
+    "envoi_auto": True,
+    "dernier_envoi": "",
+}
+
+
+def charger_config():
+    cfg = dict(CONFIG_DEFAUT)
+    if os.path.exists(FICHIER_CONFIG):
+        try:
+            with open(FICHIER_CONFIG, "r", encoding="utf-8") as f:
+                cfg.update(json.load(f))
+        except Exception:
+            pass
+    return cfg
+
+
+def sauver_config(cfg):
+    with open(FICHIER_CONFIG, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+
+def _hacher(mdp, sel_hex):
+    return hashlib.pbkdf2_hmac("sha256", mdp.encode("utf-8"),
+                               bytes.fromhex(sel_hex), 100000).hex()
+
+
+def definir_mdp(cfg, mdp):
+    sel = os.urandom(16).hex()
+    cfg["mdp_sel"] = sel
+    cfg["mdp_hash"] = _hacher(mdp, sel)
+
+
+def verifier_mdp(cfg, mdp):
+    if not cfg.get("mdp_hash") or not cfg.get("mdp_sel"):
+        return False
+    return hmac.compare_digest(cfg["mdp_hash"], _hacher(mdp, cfg["mdp_sel"]))
+
+
+# ---------- MAIL ----------
+def mail_configure(cfg):
+    return bool(cfg.get("expediteur") and cfg.get("mdp_app") and cfg.get("destinataire"))
+
+
+def construire_corps_mail(data, aujourdhui=None):
+    """Résumé texte des séances d'hier et d'aujourd'hui."""
+    aujourdhui = aujourdhui or date.today()
+    isos = [(aujourdhui - timedelta(days=1)).strftime("%Y-%m-%d"),
+            aujourdhui.strftime("%Y-%m-%d")]
+    lignes = [f"Rapport de présences - envoyé le {aujourdhui.strftime('%d/%m/%Y')}", ""]
+    trouve = False
+    for iso in isos:
+        for nom_c in sorted(data.get("classes", {}), key=lambda x: x.lower()):
+            c = data["classes"][nom_c]
+            for s_idx, seq in enumerate(c["sequences"]):
+                for k, d in enumerate(seq["dates"]):
+                    if d != iso:
+                        continue
+                    trouve = True
+                    presents, absents, vides = [], [], []
+                    for el in c["eleves"]:
+                        slots = seq["presences"].get(el, [])
+                        v = slots[k] if k < len(slots) else ""
+                        if v == "P":
+                            presents.append(el)
+                        elif v == "A":
+                            absents.append(el)
+                        else:
+                            vides.append(el)
+                    jour = datetime.strptime(iso, "%Y-%m-%d").strftime("%d/%m/%Y")
+                    lignes.append(f"{jour} - {nom_c} (séquence {s_idx + 1}, colonne {k + 1})")
+                    lignes.append(f"  Présents ({len(presents)}) : {', '.join(presents) or '-'}")
+                    lignes.append(f"  Absents ({len(absents)}) : {', '.join(absents) or '-'}")
+                    if vides:
+                        lignes.append(f"  Non saisis ({len(vides)}) : {', '.join(vides)}")
+                    lignes.append("")
+    if not trouve:
+        lignes.append("Aucune séance datée d'hier ou d'aujourd'hui.")
+        lignes.append("")
+    lignes.append("La sauvegarde complète (JSON) est en pièce jointe.")
+    return "\n".join(lignes)
+
+
+def contexte_ssl():
+    # Sur Android, le magasin de certificats système n'est pas lisible par Python :
+    # on utilise certifi s'il est présent.
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return ssl.create_default_context()
+
+
+def envoyer_mail_smtp(cfg, sujet, corps, nom_pj, octets_pj):
+    if not mail_configure(cfg):
+        raise ValueError("Réglages mail incomplets.")
+    msg = EmailMessage()
+    msg["From"] = cfg["expediteur"]
+    msg["To"] = cfg["destinataire"]
+    msg["Subject"] = sujet
+    msg.set_content(corps)
+    msg.add_attachment(octets_pj, maintype="application", subtype="json",
+                       filename=nom_pj)
+    serveur = cfg.get("smtp_serveur") or "smtp.gmail.com"
+    port = int(cfg.get("smtp_port") or 465)
+    mdp = cfg["mdp_app"].replace(" ", "")
+    ctx = contexte_ssl()
+    if port == 465:
+        with smtplib.SMTP_SSL(serveur, port, context=ctx, timeout=30) as s:
+            s.login(cfg["expediteur"], mdp)
+            s.send_message(msg)
+    else:
+        with smtplib.SMTP(serveur, port, timeout=30) as s:
+            s.starttls(context=ctx)
+            s.login(cfg["expediteur"], mdp)
+            s.send_message(msg)
+
+
 # ---------- APPLICATION ----------
 class AppPresences(App):
 
     def build(self):
         self.title = "Présences"
         self.data = charger()
+        self.cfg = charger_config()
         self.mode_barre = False
+        self.admin = False            # True = onglet MODIFIER déverrouillé
+        self.envoi_en_cours = False
+        self.statut_mail = ""
 
         racine = BoxLayout(orientation="vertical", padding=dp(6), spacing=dp(4))
 
@@ -211,6 +404,18 @@ class AppPresences(App):
             size_hint_y=None, height=dp(32),
             bold=True, font_size=dp(18)
         ))
+
+        # ===== Onglets =====
+        ligne_onglets = BoxLayout(size_hint_y=None, height=dp(40), spacing=dp(4))
+        self.onglet_pres = Button(text="PRÉSENCES", bold=True, font_size=dp(13),
+                                  color=(1, 1, 1, 1))
+        self.onglet_modif = Button(text="MODIFIER (code)", bold=True, font_size=dp(13),
+                                   color=(1, 1, 1, 1))
+        self.onglet_pres.bind(on_press=self.aller_presences)
+        self.onglet_modif.bind(on_press=self.aller_modifier)
+        ligne_onglets.add_widget(self.onglet_pres)
+        ligne_onglets.add_widget(self.onglet_modif)
+        racine.add_widget(ligne_onglets)
 
         # ===== Sélecteur de classe =====
         ligne_classe = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(4))
@@ -242,15 +447,31 @@ class AppPresences(App):
         ligne_gestion.add_widget(b_sup)
         racine.add_widget(ligne_gestion)
 
-        # ===== Mode barré =====
+        # ===== Mode barré + Sauvegarde =====
         ligne_mode = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(4))
         self.btn_mode = Button(
-            text="MODE NORMAL (clic -> change le statut)",
+            text="MODE NORMAL",
             background_color=get_color_from_hex("#9E9E9E"),
             color=(1, 1, 1, 1), bold=True, font_size=dp(13)
         )
         self.btn_mode.bind(on_press=self.toggle_mode)
+        btn_sauvegarde = Button(
+            text="Sauvegarde",
+            background_color=get_color_from_hex("#00897B"),
+            color=(1, 1, 1, 1), bold=True, font_size=dp(13),
+            size_hint_x=0.3
+        )
+        btn_sauvegarde.bind(on_press=self.menu_sauvegarde)
+        btn_mail = Button(
+            text="Mail",
+            background_color=get_color_from_hex("#5E35B1"),
+            color=(1, 1, 1, 1), bold=True, font_size=dp(13),
+            size_hint_x=0.2
+        )
+        btn_mail.bind(on_press=self.menu_mail)
         ligne_mode.add_widget(self.btn_mode)
+        ligne_mode.add_widget(btn_sauvegarde)
+        ligne_mode.add_widget(btn_mail)
         racine.add_widget(ligne_mode)
 
         # ===== Info =====
@@ -274,23 +495,24 @@ class AppPresences(App):
 
         # ===== Légende =====
         legende = BoxLayout(size_hint_y=None, height=dp(24), spacing=dp(4))
-        legende.add_widget(Label(text="P = Présent", size_hint_x=0.25,
-                                 font_size=dp(12),
+        legende.add_widget(Label(text="P=Présent", size_hint_x=0.2,
+                                 font_size=dp(11),
                                  color=get_color_from_hex(C_PRESENT), bold=True))
-        legende.add_widget(Label(text="A = Absent", size_hint_x=0.25,
-                                 font_size=dp(12),
+        legende.add_widget(Label(text="A=Absent", size_hint_x=0.2,
+                                 font_size=dp(11),
                                  color=get_color_from_hex(C_ABSENT), bold=True))
-        legende.add_widget(Label(text="Barré = bleu", size_hint_x=0.25,
-                                 font_size=dp(12),
+        legende.add_widget(Label(text="Barré=bleu", size_hint_x=0.2,
+                                 font_size=dp(11),
                                  color=(0.13, 0.59, 0.95, 1), bold=True))
-        legende.add_widget(Label(text="MT = libre", size_hint_x=0.25,
-                                 font_size=dp(12), color=(0.4, 0.4, 0.4, 1)))
+        legende.add_widget(Label(text="Pâle=verrouillé", size_hint_x=0.25,
+                                 font_size=dp(11), color=(0.4, 0.4, 0.4, 1)))
+        legende.add_widget(Label(text="MT=libre", size_hint_x=0.15,
+                                 font_size=dp(11), color=(0.4, 0.4, 0.4, 1)))
         racine.add_widget(legende)
 
-        # ===== Zone du tableau (avec barre de défilement intégrée) =====
+        # ===== Zone du tableau =====
         self.scroll = ScrollView(
-            do_scroll_x=True,
-            do_scroll_y=True,
+            do_scroll_x=True, do_scroll_y=True,
             scroll_type=['bars', 'content'],
             bar_width=dp(10),
             bar_color=(0.4, 0.5, 0.6, 1),
@@ -305,18 +527,489 @@ class AppPresences(App):
         racine.add_widget(self.scroll)
 
         self.rafraichir_spinner()
+        self.maj_onglets()
         self.rafraichir()
 
         return racine
 
-    # ---------- MODE BARRÉ ----------
+    # ============================================================
+    #            DÉMARRAGE / REPRISE : ENVOI AUTO 1x/JOUR
+    # ============================================================
+    def on_start(self):
+        Clock.schedule_once(self.envoi_auto_si_besoin, 2)
+
+    def on_resume(self):
+        Clock.schedule_once(self.envoi_auto_si_besoin, 2)
+
+    def envoi_auto_si_besoin(self, *args):
+        cfg = self.cfg
+        if not cfg.get("envoi_auto") or not mail_configure(cfg):
+            return
+        if cfg.get("dernier_envoi") == date.today().strftime("%Y-%m-%d"):
+            return
+        if not self.data.get("classes"):
+            return
+        self.envoyer_mail(auto=True)
+
+    # ============================================================
+    #                 ONGLETS + MOT DE PASSE
+    # ============================================================
+    def maj_onglets(self):
+        if self.admin:
+            self.onglet_pres.background_color = get_color_from_hex("#9E9E9E")
+            self.onglet_modif.background_color = get_color_from_hex(C_MODIF)
+        else:
+            self.onglet_pres.background_color = get_color_from_hex("#1565C0")
+            self.onglet_modif.background_color = get_color_from_hex("#9E9E9E")
+
+    def aller_presences(self, *args):
+        if self.admin:
+            self.admin = False
+            self.maj_onglets()
+            self.rafraichir()
+
+    def aller_modifier(self, *args):
+        if self.admin:
+            return
+        if not self.cfg.get("mdp_hash"):
+            self.popup_nouveau_mdp("Créer le mot de passe", deverrouiller=True)
+        else:
+            self.popup_demander_mdp()
+
+    def bloque_sans_admin(self, action):
+        """True (et message) si l'action exige l'onglet MODIFIER."""
+        if self.admin:
+            return False
+        self.message("Onglet MODIFIER",
+                     f"{action}\nest réservé à l'onglet\nMODIFIER (mot de passe).")
+        return True
+
+    def popup_demander_mdp(self):
+        contenu = BoxLayout(orientation="vertical", padding=dp(10), spacing=dp(8))
+        contenu.add_widget(Label(text="Mot de passe :", size_hint_y=None, height=dp(26)))
+        champ = TextInput(password=True, multiline=False,
+                          size_hint_y=None, height=dp(42))
+        contenu.add_widget(champ)
+        lbl_err = Label(text="", size_hint_y=None, height=dp(24),
+                        color=get_color_from_hex("#F44336"), font_size=dp(12))
+        contenu.add_widget(lbl_err)
+        ligne = BoxLayout(size_hint_y=None, height=dp(45), spacing=dp(6))
+        b_ok = Button(text="Valider", background_color=get_color_from_hex(C_MODIF),
+                      color=(1, 1, 1, 1))
+        b_non = Button(text="Annuler")
+        ligne.add_widget(b_ok)
+        ligne.add_widget(b_non)
+        contenu.add_widget(ligne)
+        pop = Popup(title="Onglet MODIFIER", content=contenu, size_hint=(0.85, 0.42))
+
+        def valider(*a):
+            if verifier_mdp(self.cfg, champ.text):
+                pop.dismiss()
+                self.admin = True
+                self.maj_onglets()
+                self.rafraichir()
+            else:
+                champ.text = ""
+                lbl_err.text = "Mot de passe incorrect."
+
+        b_ok.bind(on_press=valider)
+        champ.bind(on_text_validate=valider)
+        b_non.bind(on_press=pop.dismiss)
+        pop.open()
+
+    def popup_nouveau_mdp(self, titre, deverrouiller=False):
+        contenu = BoxLayout(orientation="vertical", padding=dp(10), spacing=dp(8))
+        contenu.add_widget(Label(
+            text=f"Choisis un mot de passe ({MDP_MIN} caractères min.)",
+            size_hint_y=None, height=dp(26), font_size=dp(12)))
+        champ1 = TextInput(password=True, multiline=False, hint_text="Mot de passe",
+                           size_hint_y=None, height=dp(42))
+        champ2 = TextInput(password=True, multiline=False, hint_text="Confirmer",
+                           size_hint_y=None, height=dp(42))
+        contenu.add_widget(champ1)
+        contenu.add_widget(champ2)
+        lbl_err = Label(text="", size_hint_y=None, height=dp(24),
+                        color=get_color_from_hex("#F44336"), font_size=dp(12))
+        contenu.add_widget(lbl_err)
+        ligne = BoxLayout(size_hint_y=None, height=dp(45), spacing=dp(6))
+        b_ok = Button(text="Enregistrer", background_color=get_color_from_hex(C_MODIF),
+                      color=(1, 1, 1, 1))
+        b_non = Button(text="Annuler")
+        ligne.add_widget(b_ok)
+        ligne.add_widget(b_non)
+        contenu.add_widget(ligne)
+        pop = Popup(title=titre, content=contenu, size_hint=(0.85, 0.55))
+
+        def valider(*a):
+            if len(champ1.text) < MDP_MIN:
+                lbl_err.text = f"Minimum {MDP_MIN} caractères."
+                return
+            if champ1.text != champ2.text:
+                lbl_err.text = "Les deux mots de passe diffèrent."
+                return
+            definir_mdp(self.cfg, champ1.text)
+            sauver_config(self.cfg)
+            pop.dismiss()
+            if deverrouiller:
+                self.admin = True
+                self.maj_onglets()
+                self.rafraichir()
+            else:
+                self.message("Mot de passe", "Mot de passe modifié.")
+
+        b_ok.bind(on_press=valider)
+        b_non.bind(on_press=pop.dismiss)
+        pop.open()
+
+    # ============================================================
+    #                          MAIL
+    # ============================================================
+    def menu_mail(self, *args):
+        cfg = self.cfg
+        contenu = BoxLayout(orientation="vertical", padding=dp(10), spacing=dp(8))
+        if mail_configure(cfg):
+            etat = (f"Destinataire : {cfg['destinataire']}\n"
+                    f"Envoi auto (1x/jour) : {'OUI' if cfg.get('envoi_auto') else 'NON'}\n"
+                    f"Dernier envoi : {cfg.get('dernier_envoi') or 'jamais'}")
+        else:
+            etat = ("Mail non configuré.\n"
+                    "Onglet MODIFIER, puis Mail > Réglages.")
+        contenu.add_widget(Label(text=etat, size_hint_y=None, height=dp(70),
+                                 font_size=dp(12)))
+        b_env = Button(text="Envoyer maintenant", size_hint_y=None, height=dp(48),
+                       background_color=get_color_from_hex("#5E35B1"),
+                       color=(1, 1, 1, 1), bold=True)
+        contenu.add_widget(b_env)
+        b_reg = b_mdp = None
+        if self.admin:
+            b_reg = Button(text="Réglages mail", size_hint_y=None, height=dp(44),
+                           background_color=get_color_from_hex("#455A64"),
+                           color=(1, 1, 1, 1))
+            b_mdp = Button(text="Changer le mot de passe", size_hint_y=None,
+                           height=dp(44),
+                           background_color=get_color_from_hex("#455A64"),
+                           color=(1, 1, 1, 1))
+            contenu.add_widget(b_reg)
+            contenu.add_widget(b_mdp)
+        contenu.add_widget(Label())
+        b_fermer = Button(text="Fermer", size_hint_y=None, height=dp(45))
+        contenu.add_widget(b_fermer)
+        pop = Popup(title="Envoi par mail", content=contenu, size_hint=(0.9, 0.7))
+
+        def envoyer(*a):
+            pop.dismiss()
+            self.envoyer_mail(auto=False)
+
+        def reglages(*a):
+            pop.dismiss()
+            self.reglages_mail()
+
+        def changer(*a):
+            pop.dismiss()
+            self.popup_nouveau_mdp("Changer le mot de passe")
+
+        b_env.bind(on_press=envoyer)
+        if b_reg:
+            b_reg.bind(on_press=reglages)
+            b_mdp.bind(on_press=changer)
+        b_fermer.bind(on_press=pop.dismiss)
+        pop.open()
+
+    def reglages_mail(self):
+        if self.bloque_sans_admin("Les réglages mail"):
+            return
+        cfg = self.cfg
+        contenu = BoxLayout(orientation="vertical", padding=dp(10), spacing=dp(6))
+        contenu.add_widget(Label(
+            text="Gmail : crée un « mot de passe d'application »\n"
+                 "(compte Google > Sécurité > validation en 2 étapes).",
+            size_hint_y=None, height=dp(44), font_size=dp(11)))
+        f_exp = TextInput(text=cfg.get("expediteur", ""), multiline=False,
+                          hint_text="Adresse expéditeur (Gmail)",
+                          size_hint_y=None, height=dp(40))
+        f_mdp = TextInput(text="", multiline=False, password=True,
+                          hint_text=("Mot de passe d'application (inchangé si vide)"
+                                     if cfg.get("mdp_app")
+                                     else "Mot de passe d'application"),
+                          size_hint_y=None, height=dp(40))
+        f_dest = TextInput(text=cfg.get("destinataire", ""), multiline=False,
+                           hint_text="Adresse destinataire",
+                           size_hint_y=None, height=dp(40))
+        for w in (f_exp, f_mdp, f_dest):
+            contenu.add_widget(w)
+        etat_auto = [bool(cfg.get("envoi_auto", True))]
+        b_auto = Button(text="", size_hint_y=None, height=dp(40),
+                        background_color=get_color_from_hex("#607D8B"),
+                        color=(1, 1, 1, 1))
+
+        def maj_auto():
+            b_auto.text = "Envoi auto 1x/jour : " + ("OUI" if etat_auto[0] else "NON")
+
+        def basculer(*a):
+            etat_auto[0] = not etat_auto[0]
+            maj_auto()
+
+        maj_auto()
+        b_auto.bind(on_press=basculer)
+        contenu.add_widget(b_auto)
+        contenu.add_widget(Label())
+        ligne = BoxLayout(size_hint_y=None, height=dp(45), spacing=dp(6))
+        b_ok = Button(text="Enregistrer", background_color=get_color_from_hex("#009688"),
+                      color=(1, 1, 1, 1))
+        b_non = Button(text="Annuler")
+        ligne.add_widget(b_ok)
+        ligne.add_widget(b_non)
+        contenu.add_widget(ligne)
+        pop = Popup(title="Réglages mail", content=contenu, size_hint=(0.95, 0.85))
+
+        def enregistrer(*a):
+            exp = f_exp.text.strip()
+            dest = f_dest.text.strip()
+            if "@" not in exp or "@" not in dest:
+                self.message("Erreur", "Adresses mail invalides.")
+                return
+            cfg["expediteur"] = exp
+            cfg["destinataire"] = dest
+            if f_mdp.text.strip():
+                cfg["mdp_app"] = f_mdp.text.strip()
+            cfg["envoi_auto"] = etat_auto[0]
+            if not cfg.get("mdp_app"):
+                self.message("Erreur", "Mot de passe d'application manquant.")
+                return
+            sauver_config(cfg)
+            pop.dismiss()
+            self.message("Mail", "Réglages enregistrés.\nTeste avec « Envoyer maintenant ».")
+
+        b_ok.bind(on_press=enregistrer)
+        b_non.bind(on_press=pop.dismiss)
+        pop.open()
+
+    def envoyer_mail(self, auto=False):
+        if self.envoi_en_cours:
+            if not auto:
+                self.message("Mail", "Un envoi est déjà en cours.")
+            return
+        if not mail_configure(self.cfg):
+            if not auto:
+                self.message("Mail non configuré",
+                             "Onglet MODIFIER, puis\nMail > Réglages mail.")
+            return
+        self.envoi_en_cours = True
+        cfg = dict(self.cfg)
+        copie = json.loads(json.dumps(self.data))
+        aujourdhui = date.today()
+        iso = aujourdhui.strftime("%Y-%m-%d")
+        sujet = f"Présences {aujourdhui.strftime('%d/%m/%Y')}"
+        corps = construire_corps_mail(copie, aujourdhui)
+        octets = json.dumps(copie, ensure_ascii=False, indent=2).encode("utf-8")
+        nom_pj = f"presences_{iso}.json"
+
+        def travail():
+            ok, err = True, ""
+            try:
+                envoyer_mail_smtp(cfg, sujet, corps, nom_pj, octets)
+            except smtplib.SMTPAuthenticationError:
+                ok = False
+                err = ("Identifiants refusés.\nUtilise un mot de passe\n"
+                       "d'application Gmail (pas ton mot de passe habituel).")
+            except (OSError, smtplib.SMTPException) as e:
+                ok = False
+                err = f"Connexion impossible (internet ?)\n{e}"
+            except Exception as e:
+                ok = False
+                err = str(e)
+            Clock.schedule_once(lambda dt: self.fin_envoi(ok, err, auto, iso), 0)
+
+        threading.Thread(target=travail, daemon=True).start()
+        if not auto:
+            self.statut_mail = "envoi du mail..."
+            self.rafraichir()
+
+    def fin_envoi(self, ok, err, auto, iso):
+        self.envoi_en_cours = False
+        heure = datetime.now().strftime("%H:%M")
+        if ok:
+            self.cfg["dernier_envoi"] = iso
+            sauver_config(self.cfg)
+            self.statut_mail = f"mail envoyé {heure}"
+            if not auto:
+                self.message("Mail envoyé", f"Envoyé à :\n{self.cfg['destinataire']}")
+        else:
+            self.statut_mail = "mail : échec"
+            if not auto:
+                self.message("Échec de l'envoi", err)
+        self.rafraichir()
+
+    # ============================================================
+    #                    GESTION SAUVEGARDES
+    # ============================================================
+    def menu_sauvegarde(self, *args):
+        """Ouvre le menu de gestion des sauvegardes."""
+        contenu = BoxLayout(orientation="vertical", padding=dp(10), spacing=dp(8))
+
+        # Bouton pour créer une nouvelle sauvegarde
+        b_sauver = Button(
+            text="Créer une sauvegarde maintenant",
+            size_hint_y=None, height=dp(50),
+            background_color=get_color_from_hex("#4CAF50"),
+            color=(1, 1, 1, 1), bold=True, font_size=dp(14)
+        )
+        contenu.add_widget(b_sauver)
+
+        # Chemin du dossier
+        dossier = dossier_sauvegardes()
+        info = Label(
+            text=f"Dossier : {dossier}",
+            size_hint_y=None, height=dp(40),
+            font_size=dp(10), color=(0.4, 0.4, 0.4, 1)
+        )
+        contenu.add_widget(info)
+
+        # Titre liste
+        contenu.add_widget(Label(
+            text="Sauvegardes existantes (cliquez pour restaurer) :",
+            size_hint_y=None, height=dp(28),
+            bold=True, font_size=dp(12)
+        ))
+
+        # Liste des sauvegardes
+        scroll = ScrollView()
+        liste = BoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(3))
+        liste.bind(minimum_height=liste.setter("height"))
+
+        fichiers = liste_sauvegardes()
+        if not fichiers:
+            liste.add_widget(Label(
+                text="Aucune sauvegarde pour l'instant.",
+                size_hint_y=None, height=dp(40),
+                italic=True, color=(0.5, 0.5, 0.5, 1)
+            ))
+        else:
+            for f in fichiers:
+                # Extraire la date du nom de fichier
+                nom_affiche = f.replace("presences_", "").replace(".json", "")
+                btn = Button(
+                    text=nom_affiche,
+                    size_hint_y=None, height=dp(44),
+                    background_color=get_color_from_hex("#546E7A"),
+                    color=(1, 1, 1, 1), font_size=dp(12)
+                )
+                btn.bind(on_press=lambda b, nom=f: self.restaurer_sauvegarde(nom))
+                liste.add_widget(btn)
+
+        scroll.add_widget(liste)
+        contenu.add_widget(scroll)
+
+        # Bouton fermer
+        b_fermer = Button(text="Fermer", size_hint_y=None, height=dp(45))
+        contenu.add_widget(b_fermer)
+
+        pop = Popup(
+            title="Sauvegarde / Restauration",
+            content=contenu,
+            size_hint=(0.92, 0.85)
+        )
+
+        def creer_sauvegarde(*a):
+            self.creer_sauvegarde()
+            pop.dismiss()
+
+        b_sauver.bind(on_press=creer_sauvegarde)
+        b_fermer.bind(on_press=pop.dismiss)
+        pop.open()
+
+    def creer_sauvegarde(self):
+        """Crée un fichier de sauvegarde horodaté."""
+        # D'abord, s'assurer que les données actuelles sont bien sauvegardées
+        sauver(self.data)
+
+        # Créer le nom du fichier
+        nom = "presences_" + datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + ".json"
+        chemin = os.path.join(dossier_sauvegardes(), nom)
+
+        try:
+            # Copier le fichier presences.json vers le dossier de sauvegardes
+            if os.path.exists(FICHIER):
+                shutil.copy2(FICHIER, chemin)
+            else:
+                # Si presences.json n'existe pas, écrire directement les données
+                with open(chemin, "w", encoding="utf-8") as f:
+                    json.dump(self.data, f, ensure_ascii=False, indent=2)
+
+            self.message(
+                "Sauvegarde créée",
+                f"Fichier créé :\n{nom}\n\n"
+                f"Dossier :\n{dossier_sauvegardes()}\n\n"
+                f"Sur PC, tu peux copier ce fichier\n"
+                f"via USB ou Google Drive."
+            )
+        except Exception as e:
+            self.message("Erreur", f"Impossible de créer la sauvegarde :\n{e}")
+
+    def restaurer_sauvegarde(self, nom_fichier):
+        """Demande confirmation puis restaure les données."""
+        if self.bloque_sans_admin("La restauration d'une sauvegarde"):
+            return
+        chemin = os.path.join(dossier_sauvegardes(), nom_fichier)
+
+        contenu = BoxLayout(orientation="vertical", padding=dp(10), spacing=dp(10))
+        contenu.add_widget(Label(
+            text=f"Restaurer la sauvegarde ?\n\n{nom_fichier}\n\n"
+                 f"ATTENTION : Les données actuelles\n"
+                 f"seront remplacées !"
+        ))
+        ligne = BoxLayout(size_hint_y=None, height=dp(45), spacing=dp(6))
+        b_oui = Button(text="Oui, restaurer",
+                       background_color=get_color_from_hex("#F44336"),
+                       color=(1, 1, 1, 1))
+        b_non = Button(text="Annuler")
+        ligne.add_widget(b_oui)
+        ligne.add_widget(b_non)
+        contenu.add_widget(ligne)
+
+        pop = Popup(title="Confirmer la restauration",
+                    content=contenu, size_hint=(0.9, 0.5))
+
+        def restaurer(*a):
+            try:
+                with open(chemin, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+
+                # Migration si nécessaire
+                if "classes" in data:
+                    for nom_c, c in list(data["classes"].items()):
+                        data["classes"][nom_c] = migrer_classe(c)
+
+                # Sauvegarder les données restaurées
+                self.data = data
+                sauver(self.data)
+
+                pop.dismiss()
+                self.rafraichir_spinner()
+                self.rafraichir()
+
+                self.message(
+                    "Restauration réussie",
+                    f"Les données ont été restaurées depuis :\n{nom_fichier}"
+                )
+            except Exception as e:
+                pop.dismiss()
+                self.message("Erreur", f"Impossible de restaurer :\n{e}")
+
+        b_oui.bind(on_press=restaurer)
+        b_non.bind(on_press=pop.dismiss)
+        pop.open()
+
+    # ============================================================
+    #                    MODE BARRÉ
+    # ============================================================
     def toggle_mode(self, *args):
         self.mode_barre = not self.mode_barre
         if self.mode_barre:
-            self.btn_mode.text = "MODE BARRÉ (clic -> barre/débarre la case)"
+            self.btn_mode.text = "MODE BARRÉ"
             self.btn_mode.background_color = get_color_from_hex("#1976D2")
         else:
-            self.btn_mode.text = "MODE NORMAL (clic -> change le statut)"
+            self.btn_mode.text = "MODE NORMAL"
             self.btn_mode.background_color = get_color_from_hex("#9E9E9E")
 
     # ---------- GESTION CLASSES ----------
@@ -424,6 +1117,8 @@ class AppPresences(App):
         pop.open()
 
     def supprimer_classe(self, *args):
+        if self.bloque_sans_admin("La suppression d'une classe"):
+            return
         nom = self.classe_actuelle()
         if not nom:
             self.message("Info", "Sélectionne d'abord une classe.")
@@ -484,6 +1179,12 @@ class AppPresences(App):
         if not donnees:
             return
         date_actuelle = donnees["sequences"][seq_idx]["dates"][slot_idx]
+
+        if est_verrouille(date_actuelle) and not self.admin:
+            self.message("Date verrouillée",
+                         f"Cette date a plus de {DELAI_MODIF_JOURS} jour(s).\n"
+                         "Pour la changer, utilise\nl'onglet MODIFIER.")
+            return
 
         contenu = BoxLayout(orientation="vertical", padding=dp(10), spacing=dp(8))
         titre_txt = "Modifier la date" if date_actuelle else "Ajouter une date"
@@ -641,6 +1342,8 @@ class AppPresences(App):
         self.tableau.clear_widgets()
         nom_classe = self.classe_actuelle()
         donnees = self.donnees_classe()
+        self.lbl_info.color = (0.9, 0.32, 0.0, 1) if self.admin else (0.3, 0.3, 0.3, 1)
+        suffixe = f" — {self.statut_mail}" if self.statut_mail else ""
 
         if not nom_classe:
             self.lbl_info.text = "Aucune classe — crée-en une."
@@ -652,7 +1355,9 @@ class AppPresences(App):
 
         eleves = donnees["eleves"]
         sequences = donnees["sequences"]
-        self.lbl_info.text = f"Classe « {nom_classe} » — {len(eleves)} élève(s) — {NB_SEQUENCES} séquences"
+        prefixe = "MODIFICATION — " if self.admin else ""
+        self.lbl_info.text = (f"{prefixe}« {nom_classe} » — {len(eleves)} élève(s)"
+                              f"{suffixe}")
 
         largeur_totale = (LARGEUR_NOM +
                           NB_SEQUENCES * (SLOTS_PAR_SEQ * LARGEUR_CELL + LARGEUR_MT + LARGEUR_SEP))
@@ -710,14 +1415,15 @@ class AppPresences(App):
                     val = slots[k_idx]
                     est_barre = barres[k_idx]
 
+                    verr = est_verrouille(seq["dates"][k_idx])
                     if val == "P":
-                        couleur = C_PRESENT
+                        couleur = C_PRESENT_VERR if verr else C_PRESENT
                         texte = "P"
-                        txt_c = (1, 1, 1, 1)
+                        txt_c = (0.2, 0.2, 0.2, 1) if verr else (1, 1, 1, 1)
                     elif val == "A":
-                        couleur = C_ABSENT
+                        couleur = C_ABSENT_VERR if verr else C_ABSENT
                         texte = "A"
-                        txt_c = (1, 1, 1, 1)
+                        txt_c = (0.2, 0.2, 0.2, 1) if verr else (1, 1, 1, 1)
                     else:
                         couleur = C_VIDE
                         texte = ""
@@ -734,7 +1440,6 @@ class AppPresences(App):
                              self.clic_cellule(n, s, k))
                     ligne.add_widget(btn)
 
-                # Colonne MT
                 texte_mt = seq["mt"].get(eleve, "")
                 if texte_mt:
                     couleur_mt = (1, 1, 1, 1)
@@ -768,6 +1473,13 @@ class AppPresences(App):
             barres[slot_idx] = not barres[slot_idx]
             seq["barres"][nom] = barres
         else:
+            if est_verrouille(seq["dates"][slot_idx]) and not self.admin:
+                self.message(
+                    "Présence verrouillée",
+                    f"Cette séance date de plus de {DELAI_MODIF_JOURS} jour(s).\n"
+                    "Tu peux la barrer (MODE BARRÉ)\n"
+                    "ou utiliser l'onglet MODIFIER.")
+                return
             slots = seq["presences"].get(nom, [""] * SLOTS_PAR_SEQ)
             while len(slots) < SLOTS_PAR_SEQ:
                 slots.append("")
@@ -781,6 +1493,8 @@ class AppPresences(App):
         self.rafraichir()
 
     def confirmer_suppression(self, nom):
+        if self.bloque_sans_admin("La suppression d'un élève"):
+            return
         donnees = self.donnees_classe()
         if not donnees:
             return
@@ -815,7 +1529,7 @@ class AppPresences(App):
         contenu.add_widget(Label(text=msg))
         btn = Button(text="OK", size_hint_y=None, height=dp(45))
         contenu.add_widget(btn)
-        pop = Popup(title=titre, content=contenu, size_hint=(0.85, 0.4))
+        pop = Popup(title=titre, content=contenu, size_hint=(0.85, 0.5))
         btn.bind(on_press=pop.dismiss)
         pop.open()
 
