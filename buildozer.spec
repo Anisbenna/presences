@@ -8,12 +8,12 @@ source.dir = .
 source.include_exts = py,png,jpg,jpeg,kv,atlas
 
 version = 1.0
-requirements = python3==3.11.5,kivy==2.3.0
+requirements = python3==3.11.5,kivy==2.3.0,openssl,certifi
 
 orientation = portrait
 fullscreen = 0
 
-android.permissions = WRITE_EXTERNAL_STORAGE,READ_EXTERNAL_STORAGE
+android.permissions = INTERNET,WRITE_EXTERNAL_STORAGE,READ_EXTERNAL_STORAGE,MANAGE_EXTERNAL_STORAGE
 
 android.api = 31
 android.minapi = 21
@@ -22,6 +22,5 @@ android.archs = arm64-v8a
 
 android.allow_backup = True
 android.accept_sdk_license = True
-android.gradle_version = 8.0.2
 
 p4a.branch = release-2024.01.21
